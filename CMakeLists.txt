@@ -62,6 +62,7 @@ if (APPLE)
     option(WHISPER_COREML              "whisper: enable Core ML framework" OFF)
 else()
     option(WHISPER_SUPPORT_OPENBLAS    "whisper: support for OpenBLAS" OFF)
+    option(WHISPER_SUPPORT_CUBLAS      "whisper: support for cuBLAS" OFF)
 endif()
 
 option(WHISPER_PERF                    "whisper: enable perf timings" OFF)
@@ -135,6 +136,21 @@ if (WHISPER_SUPPORT_OPENBLAS)
         message(WARNING "OpenBLAS not found")
     endif()
 endif()
+
+if (WHISPER_SUPPORT_CUBLAS)
+    find_package(CUDAToolkit)
+    if (CUDAToolkit_FOUND)
+        message(STATUS "cuBLAS found")
+
+        add_compile_definitions(GGML_USE_CUBLAS)
+
+        set(WHISPER_EXTRA_LIBS ${WHISPER_EXTRA_LIBS} CUDA::cudart CUDA::cublas CUDA::cublasLt)
+    else()
+        message(WARNING "cuBLAS not found")
+    endif()
+endif()
+
+
 
 # compiler flags
 
