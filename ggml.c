@@ -3085,7 +3085,7 @@ struct ggml_context * ggml_init(struct ggml_init_params params) {
         #if defined(GGML_USE_CUBLAS)
         init_cublas();
         #endif
-        
+
         is_first_call = false;
     }
 
@@ -6656,6 +6656,21 @@ static void ggml_compute_forward_mul_mat_f32(
             return;
         }
 
+#if defined(GGML_USE_CUBLAS)
+        float *d_X = NULL;
+        float *d_Y = NULL;
+        float *d_D = NULL;
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        const int x_ne = ne01 * ne10;
+        const int y_ne = ne11 * ne10;
+        const int d_ne = ne11 * ne01;
+
+        CUDA_CHECK(cudaMalloc((void **)(&d_X), sizeof(float) * x_ne));
+        CUDA_CHECK(cudaMalloc((void **)(&d_Y), sizeof(float) * y_ne));
+        CUDA_CHECK(cudaMalloc((void **)(&d_D), sizeof(float) * d_ne));
+#endif
+
         for (int64_t i03 = 0; i03 < ne03; i03++) {
             for (int64_t i02 = 0; i02 < ne02; i02++) {
                 const float * x = (float *) ((char *) src0->data + i02*nb02 + i03*nb03);
@@ -6663,7 +6678,23 @@ static void ggml_compute_forward_mul_mat_f32(
 
                 float * d = (float *) ((char *) dst->data + i02*nb2 + i03*nb3);
 
-                // TODO: cublas
+#if defined(GGML_USE_CUBLAS)
+                // copy data to device
+                CUDA_CHECK(cudaMemcpyAsync(d_X, x, sizeof(float) * x_ne, cudaMemcpyHostToDevice, cudaStream));
+                CUDA_CHECK(cudaMemcpyAsync(d_Y, y, sizeof(float) * y_ne, cudaMemcpyHostToDevice, cudaStream));
+
+                // compute
+                CUBLAS_CHECK(
+                    cublasSgemm(cublasH, CUBLAS_OP_T, CUBLAS_OP_N,
+                            ne01, ne11, ne10,
+                            &alpha, d_X, ne00,
+                                    d_Y, ne10,
+                            &beta,  d_D, ne01));
+
+                // copy data to host
+                CUDA_CHECK(cudaMemcpyAsync(d, d_D, sizeof(float) * d_ne, cudaMemcpyDeviceToHost, cudaStream));
+                CUDA_CHECK(cudaStreamSynchronize(cudaStream));
+#else
                 // zT = y * xT
                 cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         ne11, ne01, ne10,
@@ -6672,6 +6703,12 @@ static void ggml_compute_forward_mul_mat_f32(
                         0.0f,    d, ne01);
             }
         }
+
+#if defined(GGML_USE_CUBLAS)
+        CUDA_CHECK(cudaFree(d_X));
+        CUDA_CHECK(cudaFree(d_Y));
+        CUDA_CHECK(cudaFree(d_D));
+#endif
 
         //printf("CBLAS F32 = %f ms, %d x %d x %d x %d\n", (ggml_perf_time_us() - t0)/1000.0, ne0, ne1, ne2, ne3);
 
@@ -6818,10 +6855,39 @@ static void ggml_compute_forward_mul_mat_f16_f32(
             return;
         }
 
+
+#if defined(GGML_USE_CUBLAS)
+        ggml_fp16_t * const wdata = params->wdata;
+
+        float *d_X = NULL;
+        float *d_Y = NULL;
+        float *d_D = NULL;
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        const int x_ne = ne01 * ne10;
+        const int y_ne = ne11 * ne10;
+        const int d_ne = ne11 * ne01;
+
+        CUDA_CHECK(cudaMalloc((void **)(&d_X), sizeof(ggml_fp16_t) * x_ne));
+        CUDA_CHECK(cudaMalloc((void **)(&d_Y), sizeof(float) * y_ne));
+        CUDA_CHECK(cudaMalloc((void **)(&d_D), sizeof(float) * d_ne));
+#else
         float * const wdata = params->wdata;
+#endif 
 
         for (int64_t i03 = 0; i03 < ne03; i03++) {
             for (int64_t i02 = 0; i02 < ne02; i02++) {
+#if defined(GGML_USE_CUBLAS)
+                // with cuBlAS, instead of converting src0 to fp32, we convert src1 to fp16
+                {
+                    size_t id = 0;
+                    for (int64_t i01 = 0; i01 < ne11; ++i01) {
+                        for (int64_t i00 = 0; i00 < ne10; ++i00) {
+                            wdata[id++] = GGML_FP32_TO_FP16(*(float *) ((char *) src1->data + i03*nb13 + i02*nb12 + i01*nb11 + i00*nb10));
+                        }
+                    }
+                }
+#else
                 {
                     size_t id = 0;
                     for (int64_t i01 = 0; i01 < ne01; ++i01) {
@@ -6830,7 +6896,32 @@ static void ggml_compute_forward_mul_mat_f16_f32(
                         }
                     }
                 }
+#endif
 
+#if defined(GGML_USE_CUBLAS)
+                const ggml_fp16_t * x = (ggml_fp16_t *) ((char *) src0->data + i02*nb02 + i03*nb03);
+                const ggml_fp16_t * y = (ggml_fp16_t *) wdata;
+
+                float * d = (float *) ((char *) dst->data + i02*nb2 + i03*nb3);
+
+                // copy data to device
+                CUDA_CHECK(cudaMemcpyAsync(d_X, x, sizeof(ggml_fp16_t) * x_ne, cudaMemcpyHostToDevice, cudaStream));
+                CUDA_CHECK(cudaMemcpyAsync(d_Y, y, sizeof(ggml_fp16_t) * y_ne, cudaMemcpyHostToDevice, cudaStream));
+
+                // compute
+                CUBLAS_CHECK(
+                    cublasGemmEx(cublasH, CUBLAS_OP_T, CUBLAS_OP_N,
+                            ne01, ne11, ne10,
+                            &alpha, d_X, CUDA_R_16F, ne00,
+                                    d_Y, CUDA_R_16F, ne10,
+                            &beta,  d_D, CUDA_R_32F, ne01,
+                            CUBLAS_COMPUTE_32F,
+                            CUBLAS_GEMM_DEFAULT));
+
+                // copy data to host
+                CUDA_CHECK(cudaMemcpyAsync(d, d_D, sizeof(float) * d_ne, cudaMemcpyDeviceToHost, cudaStream));
+                CUDA_CHECK(cudaStreamSynchronize(cudaStream));
+#else
                 const float * x = wdata;
                 const float * y = (float *) ((char *) src1->data + i02*nb12 + i03*nb13);
 
@@ -6843,6 +6934,7 @@ static void ggml_compute_forward_mul_mat_f16_f32(
                         1.0f,    y, ne10,
                                  x, ne00,
                         0.0f,    d, ne01);
+#endif
             }
         }
 
@@ -7035,6 +7127,21 @@ static void ggml_compute_forward_mul_mat_q_f32(
         float * const wdata = params->wdata;
         dequantize_row_q_t const dequantize_row_q = quantize_fns[type].dequantize_row_q;
 
+#if defined(GGML_USE_CUBLAS)
+        float *d_X = NULL;
+        float *d_Y = NULL;
+        float *d_D = NULL;
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        const int x_ne = ne01 * ne10;
+        const int y_ne = ne11 * ne10;
+        const int d_ne = ne11 * ne01;
+
+        CUDA_CHECK(cudaMalloc((void **)(&d_X), sizeof(float) * x_ne));
+        CUDA_CHECK(cudaMalloc((void **)(&d_Y), sizeof(float) * y_ne));
+        CUDA_CHECK(cudaMalloc((void **)(&d_D), sizeof(float) * d_ne));
+#endif
+
         for (int64_t i03 = 0; i03 < ne03; i03++) {
             for (int64_t i02 = 0; i02 < ne02; i02++) {
                 {
@@ -7050,15 +7157,38 @@ static void ggml_compute_forward_mul_mat_q_f32(
 
                 float * d = (float *) ((char *) dst->data + i02*nb2 + i03*nb3);
 
-                // TODO cublas
+#if defined(GGML_USE_CUBLAS)
+                // copy data to device
+                CUDA_CHECK(cudaMemcpyAsync(d_X, x, sizeof(float) * x_ne, cudaMemcpyHostToDevice, cudaStream));
+                CUDA_CHECK(cudaMemcpyAsync(d_Y, y, sizeof(float) * y_ne, cudaMemcpyHostToDevice, cudaStream));
+
+                // compute
+                CUBLAS_CHECK(
+                    cublasSgemm(cublasH, CUBLAS_OP_T, CUBLAS_OP_N,
+                            ne01, ne11, ne10,
+                            &alpha, d_X, ne00,
+                                    d_Y, ne10,
+                            &beta,  d_D, ne01));
+
+                // copy data to host
+                CUDA_CHECK(cudaMemcpyAsync(d, d_D, sizeof(float) * d_ne, cudaMemcpyDeviceToHost, cudaStream));
+                CUDA_CHECK(cudaStreamSynchronize(cudaStream));
+#else
                 // zT = y * xT
                 cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                         ne11, ne01, ne10,
                         1.0f,    y, ne10,
                                  x, ne00,
                         0.0f,    d, ne01);
+#endif
             }
         }
+
+#if defined(GGML_USE_CUBLAS)
+        CUDA_CHECK(cudaFree(d_X));
+        CUDA_CHECK(cudaFree(d_Y));
+        CUDA_CHECK(cudaFree(d_D));
+#endif
 
         //printf("CBLAS = %f ms, %d x %d x %d x %d\n", (ggml_perf_time_us() - t0)/1000.0, ne0, ne1, ne2, ne3);
 
@@ -11237,6 +11367,14 @@ int ggml_cpu_has_wasm_simd(void) {
 
 int ggml_cpu_has_blas(void) {
 #if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS) || defined(GGML_USE_CUBLAS)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int ggml_cpu_has_cublas(void) {
+#if defined(GGML_USE_CUBLAS)
     return 1;
 #else
     return 0;
