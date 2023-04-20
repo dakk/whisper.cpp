@@ -6701,6 +6701,7 @@ static void ggml_compute_forward_mul_mat_f32(
                         1.0f,    y, ne10,
                                  x, ne00,
                         0.0f,    d, ne01);
+#endif
             }
         }
 
